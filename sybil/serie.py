@@ -36,6 +36,7 @@ class Serie:
         censor_time: Optional[int] = None,
         file_type: Literal["png", "dicom"] = "dicom",
         split: Literal["train", "dev", "test"] = "test",
+        num_images = 0,
     ):
         """Initialize a Serie.
 
@@ -66,6 +67,8 @@ class Serie:
         self._censor_time = censor_time
         self._label = label
         args = self._load_args(file_type)
+        if num_images > 0:
+            args.num_images = num_images
         self._args = args
         self._loader = get_sample_loader(split, args)
         self._meta = self._load_metadata(dicoms, voxel_spacing, file_type)

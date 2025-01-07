@@ -1,15 +1,22 @@
+'''
+NOTES:
+    - Ignoring "bad_label" and "invalid_label" checks in skip_sample because labels are not needed for FM training task
+'''
+
 import os
 from posixpath import split
 import traceback, warnings
 import pickle, json
 import numpy as np
 import pydicom
+import random
 import torchio as tio
 from tqdm import tqdm
 from collections import Counter
 import torch
 import torch.nn.functional as F
 from torch.utils import data
+from concurrent.futures import ThreadPoolExecutor
 from sybil.serie import Serie
 from sybil.utils.loading import get_sample_loader
 from sybil.datasets.utils import (
@@ -23,7 +30,7 @@ from sybil.datasets.nlst_risk_factors import NLSTRiskFactorVectorizer
 METADATA_FILENAME = {"google_test": "NLST/full_nlst_google.json"}
 
 GOOGLE_SPLITS_FILENAME = (
-    "/Mounts/rbg-storage1/datasets/NLST/Shetty_et_al(Google)/data_splits.p"
+    "/home/yuriahuja/nlst-complete/home/yuriahuja/41591_2019_447_MOESM5_ESM.xlsx"
 )
 
 CORRUPTED_PATHS = "/Mounts/rbg-storage1/datasets/NLST/corrupted_img_paths.pkl"
@@ -74,6 +81,7 @@ class NLST_Survival_Dataset(data.Dataset):
         super(NLST_Survival_Dataset, self).__init__()
 
         self.split_group = split_group
+        self.size = args.dataset_size
         self.args = args
         self._num_images = args.num_images  # number of slices in each volume
         self._max_followup = args.max_followup
@@ -99,9 +107,11 @@ class NLST_Survival_Dataset(data.Dataset):
                 open(self.args.region_annotations_filepath, "r")
             )
 
-        self.dataset = self.create_dataset(split_group)
+        self.dataset = self.create_dataset(split_group, max_size=self.size)
         if len(self.dataset) == 0:
             return
+        
+        print(f'dataset len: {len(self.dataset)}')
 
         print(self.get_summary_statement(self.dataset, split_group))
 
@@ -113,21 +123,22 @@ class NLST_Survival_Dataset(data.Dataset):
             label: weight_per_label / count for label, count in label_counts.items()
         }
 
-        print("Class counts are: {}".format(label_counts))
-        print("Label weights are {}".format(label_weights))
+        # print("Class counts are: {}".format(label_counts))
+        # print("Label weights are {}".format(label_weights))
         self.weights = [label_weights[d[dist_key]] for d in self.dataset]
 
-    def create_dataset(self, split_group):
+    def create_dataset(self, split_group, max_size=0):
         """
         Gets the dataset from the paths and labels in the json.
         Arguments:
             split_group(str): One of ['train'|'dev'|'test'].
+            max_size (int): if > 0, restrict the dataset to so many points.
         Returns:
             The dataset as a dictionary with img paths, label,
             and additional information regarding exam or participant
         """
-        self.corrupted_paths = self.CORRUPTED_PATHS["paths"]
-        self.corrupted_series = self.CORRUPTED_PATHS["series"]
+        # self.corrupted_paths = self.CORRUPTED_PATHS["paths"]
+        # self.corrupted_series = self.CORRUPTED_PATHS["series"]
         # self.risk_factor_vectorizer = NLSTRiskFactorVectorizer(self.args)
 
         if self.args.assign_splits:
@@ -135,8 +146,10 @@ class NLST_Survival_Dataset(data.Dataset):
             self.assign_splits(self.metadata_json)
 
         dataset = []
-
-        for mrn_row in tqdm(self.metadata_json, position=0):
+        for mrn_row in self.metadata_json:
+        # for mrn_row in tqdm(self.metadata_json, position=0):
+            if max_size > 0 and len(dataset) >= max_size:
+                break
             pid, split, exams, pt_metadata = (
                 mrn_row["pid"],
                 mrn_row["split"],
@@ -159,20 +172,20 @@ class NLST_Survival_Dataset(data.Dataset):
                     thinnest_series_id = self.get_thinnest_cut(exam_dict)
 
                 elif split == "test":
-                    google_series = list(self.GOOGLE_SPLITS[pid]["exams"])
-                    nlst_series = list(exam_dict["image_series"].keys())
-                    thinnest_series_id = [s for s in nlst_series if s in google_series]
-                    assert len(thinnest_series_id) < 2
-                    if len(thinnest_series_id) > 0:
-                        thinnest_series_id = thinnest_series_id[0]
-                    elif len(thinnest_series_id) == 0:
-                        if self.args.assign_splits:
-                            thinnest_series_id = self.get_thinnest_cut(exam_dict)
-                        else:
-                            continue
+                    # google_series = list(self.GOOGLE_SPLITS[pid]["exams"])
+                    # nlst_series = list(exam_dict["image_series"].keys())
+                    # thinnest_series_id = [s for s in nlst_series if s in google_series]
+                    # assert len(thinnest_series_id) < 2
+                    # if len(thinnest_series_id) > 0:
+                    #     thinnest_series_id = thinnest_series_id[0]
+                    # elif len(thinnest_series_id) == 0:
+                    #     if self.args.assign_splits:
+                    thinnest_series_id = self.get_thinnest_cut(exam_dict)
+                        # else:
+                        #     continue
 
                 for series_id, series_dict in exam_dict["image_series"].items():
-                    if self.skip_sample(series_dict, pt_metadata):
+                    if self.skip_sample(series_dict, pt_metadata, exam_dict):
                         continue
 
                     if self.args.use_only_thin_cuts_for_ct and (
@@ -193,10 +206,10 @@ class NLST_Survival_Dataset(data.Dataset):
     def get_thinnest_cut(self, exam_dict):
         # volume that is not thin cut might be the one annotated; or there are multiple volumes with same num slices, so:
         # use annotated if available, otherwise use thinnest cut
-        possibly_annotated_series = [
-            s in self.annotations_metadata
-            for s in list(exam_dict["image_series"].keys())
-        ]
+        # possibly_annotated_series = [
+        #     s in self.annotations_metadata
+        #     for s in list(exam_dict["image_series"].keys())
+        # ]
         series_lengths = [
             len(exam_dict["image_series"][series_id]["paths"])
             for series_id in exam_dict["image_series"].keys()
@@ -207,42 +220,44 @@ class NLST_Survival_Dataset(data.Dataset):
             for k, v in exam_dict["image_series"].items()
             if len(v["paths"]) == thinnest_series_len
         ]
-        if any(possibly_annotated_series):
-            thinnest_series_id = list(exam_dict["image_series"].keys())[
-                possibly_annotated_series.index(1)
-            ]
-        else:
-            thinnest_series_id = thinnest_series_id[0]
+        # if any(possibly_annotated_series):
+        #     thinnest_series_id = list(exam_dict["image_series"].keys())[
+        #         possibly_annotated_series.index(1)
+        #     ]
+        # else:
+        thinnest_series_id = thinnest_series_id[0]
         return thinnest_series_id
 
-    def skip_sample(self, series_dict, pt_metadata):
-        series_data = series_dict["series_data"]
+    def skip_sample(self, series_dict, pt_metadata, exam_dict):
+        # series_data = series_dict["series_data"]
         # check if screen is localizer screen or not enough images
-        is_localizer = self.is_localizer(series_data)
+        # is_localizer = self.is_localizer(series_data)
 
         # check if restricting to specific slice thicknesses
-        slice_thickness = series_data["reconthickness"][0]
+        # slice_thickness = series_data["reconthickness"][0]
+        slice_thickness = series_dict["slice_thickness"]
         wrong_thickness = (self.args.slice_thickness_filter is not None) and (
-            slice_thickness not in self.args.slice_thickness_filter
+            slice_thickness != self.args.slice_thickness_filter
         )
+        # wrong_thickness = False
 
         # check if valid label (info is not missing)
-        screen_timepoint = series_data["study_yr"][0]
-        bad_label = not self.check_label(pt_metadata, screen_timepoint)
+        screen_timepoint = int(exam_dict["exam"][-1])
+        # bad_label = not self.check_label(pt_metadata, screen_timepoint)
+        bad_label = False
 
         # invalid label
         if not bad_label:
-            y, _, _, time_at_event = self.get_label(pt_metadata, screen_timepoint)
-            invalid_label = (y == -1) or (time_at_event < 0)
+            y, _, _ = self.get_label(pt_metadata, screen_timepoint)
+            invalid_label = (y == -1)
         else:
             invalid_label = False
 
         insufficient_slices = len(series_dict["paths"]) < self.args.min_num_images
 
         if (
-            is_localizer
-            or wrong_thickness
-            or bad_label
+            wrong_thickness or
+            bad_label
             or invalid_label
             or insufficient_slices
         ):
@@ -253,26 +268,30 @@ class NLST_Survival_Dataset(data.Dataset):
     def get_volume_dict(
         self, series_id, series_dict, exam_dict, pt_metadata, pid, split
     ):
-        img_paths = series_dict["paths"]
-        slice_locations = series_dict["img_position"]
-        series_data = series_dict["series_data"]
-        device = series_data["manufacturer"][0]
-        screen_timepoint = series_data["study_yr"][0]
+        img_paths = [
+            os.path.join(self.args.img_dir, os.path.relpath(path, start="/home/yuriahuja/nlst-complete/home/yuriahuja/NLST_images_png"))
+            for path in series_dict["paths"]
+        ]
+        slice_locations = series_dict["slice_location"]
+        # series_data = series_dict["series_data"]
+        # device = series_data["manufacturer"][0]
+        # screen_timepoint = series_data["study_yr"][0]
+        screen_timepoint = int(exam_dict["exam"][-1])
         assert screen_timepoint == exam_dict["screen_timepoint"]
 
-        if series_id in self.corrupted_series:
-            if any([path in self.corrupted_paths for path in img_paths]):
-                uncorrupted_imgs = np.where(
-                    [path not in self.corrupted_paths for path in img_paths]
-                )[0]
-                img_paths = np.array(img_paths)[uncorrupted_imgs].tolist()
-                slice_locations = np.array(slice_locations)[uncorrupted_imgs].tolist()
+        # if series_id in self.corrupted_series:
+        #     if any([path in self.corrupted_paths for path in img_paths]):
+        #         uncorrupted_imgs = np.where(
+        #             [path not in self.corrupted_paths for path in img_paths]
+        #         )[0]
+        #         img_paths = np.array(img_paths)[uncorrupted_imgs].tolist()
+        #         slice_locations = np.array(slice_locations)[uncorrupted_imgs].tolist()
 
         sorted_img_paths, sorted_slice_locs = self.order_slices(
             img_paths, slice_locations
         )
 
-        y, y_seq, y_mask, time_at_event = self.get_label(pt_metadata, screen_timepoint)
+        y, y_seq, y_mask = self.get_label(pt_metadata, screen_timepoint)
 
         exam_int = int(
             "{}{}{}".format(
@@ -283,18 +302,18 @@ class NLST_Survival_Dataset(data.Dataset):
             "paths": sorted_img_paths,
             "slice_locations": sorted_slice_locs,
             "y": int(y),
-            "time_at_event": time_at_event,
+            # "time_at_event": time_at_event,
             "y_seq": y_seq,
             "y_mask": y_mask,
             "exam_str": "{}_{}".format(exam_dict["exam"], series_id),
             "exam": exam_int,
             "accession": exam_dict["accession_number"],
             "series": series_id,
-            "study": series_data["studyuid"][0],
+            # "study": series_data["studyuid"][0],
             "screen_timepoint": screen_timepoint,
             "pid": pid,
-            "device": device,
-            "institution": pt_metadata["cen"][0],
+            # "device": device,
+            # "institution": pt_metadata["cen"][0],
             "cancer_laterality": self.get_cancer_side(pt_metadata),
             "num_original_slices": len(series_dict["paths"]),
             "pixel_spacing": series_dict["pixel_spacing"]
@@ -316,8 +335,8 @@ class NLST_Survival_Dataset(data.Dataset):
             pt_metadata["scr_days{}".format(screen_timepoint)][0] > -1
         )
         valid_days_to_cancer = pt_metadata["candx_days"][0] > -1
-        valid_followup = pt_metadata["fup_days"][0] > -1
-        return (valid_days_since_rand) and (valid_days_to_cancer or valid_followup)
+        # valid_followup = pt_metadata["fup_days"][0] > -1
+        return (valid_days_since_rand) and (valid_days_to_cancer)
 
     def get_label(self, pt_metadata, screen_timepoint):
         days_since_rand = pt_metadata["scr_days{}".format(screen_timepoint)][0]
@@ -326,24 +345,24 @@ class NLST_Survival_Dataset(data.Dataset):
         years_to_cancer = (
             int(days_to_cancer // 365) if days_to_cancer_since_rand > -1 else 100
         )
-        days_to_last_followup = int(pt_metadata["fup_days"][0] - days_since_rand)
-        years_to_last_followup = days_to_last_followup // 365
+        # days_to_last_followup = int(pt_metadata["fup_days"][0] - days_since_rand)
+        # years_to_last_followup = days_to_last_followup // 365
         y = years_to_cancer < self.args.max_followup
         y_seq = np.zeros(self.args.max_followup)
-        cancer_timepoint = pt_metadata["cancyr"][0]
-        if y:
-            if years_to_cancer > -1:
-                assert screen_timepoint <= cancer_timepoint
-            time_at_event = years_to_cancer
-            y_seq[years_to_cancer:] = 1
-        else:
-            time_at_event = min(years_to_last_followup, self.args.max_followup - 1)
-        y_mask = np.array(
-            [1] * (time_at_event + 1)
-            + [0] * (self.args.max_followup - (time_at_event + 1))
-        )
-        assert len(y_mask) == self.args.max_followup
-        return y, y_seq.astype("float64"), y_mask.astype("float64"), time_at_event
+        cancer_timepoint = int(pt_metadata["cancyr"][0])
+        # if y:
+        #     if years_to_cancer > -1:
+        #         assert screen_timepoint <= cancer_timepoint
+        #     time_at_event = years_to_cancer
+        #     y_seq[years_to_cancer:] = 1
+        # else:
+            # time_at_event = min(years_to_last_followup, self.args.max_followup - 1)
+        # y_mask = np.array(
+        #     [1] * (time_at_event + 1)
+        #     + [0] * (self.args.max_followup - (time_at_event + 1))
+        # )
+        # assert len(y_mask) == self.args.max_followup
+        return y, y_seq.astype("float64"), None
 
     def is_localizer(self, series_dict):
         is_localizer = (
@@ -495,17 +514,17 @@ class NLST_Survival_Dataset(data.Dataset):
         return pickle.load(open(CORRUPTED_PATHS, "rb"))
 
     def get_summary_statement(self, dataset, split_group):
-        summary = "Contructed NLST CT Cancer Risk {} dataset with {} records, {} exams, {} patients, and the following class balance \n {}"
-        class_balance = Counter([d["y"] for d in dataset])
+        summary = "Contructed NLST CT Cancer Risk {} dataset with {} records, {} exams, {} patients\n"
+        # class_balance = Counter([d["y"] for d in dataset])
         exams = set([d["exam"] for d in dataset])
         patients = set([d["pid"] for d in dataset])
         statement = summary.format(
-            split_group, len(dataset), len(exams), len(patients), class_balance
+            split_group, len(dataset), len(exams), len(patients)
         )
-        statement += "\n" + "Censor Times: {}".format(
-            Counter([d["time_at_event"] for d in dataset])
-        )
-        statement
+        # statement += "\n" + "Censor Times: {}".format(
+        #     Counter([d["time_at_event"] for d in dataset])
+        # )
+        # statement
         return statement
 
     @property
@@ -549,39 +568,130 @@ class NLST_Survival_Dataset(data.Dataset):
             ]
         return sample
 
+    def mask_scan(self, x):
+        """
+        Mask a 3D CT scan based on the given `mask_size` and `mask_ratio`.
+        
+        Parameters:
+        x (torch.Tensor): The 3D CT scan, with padding on the z-axis (shape: [1, D, H, W]).
+        
+        Returns:
+        tuple: 
+            - torch.Tensor: The masked 3D CT scan (same shape as input).
+            - torch.Tensor: The mask array (same shape as input), where masked regions are 1 and others are 0.
+        """
+        # Squeeze batch dimension to work with [D, H, W] shape
+        x = x.squeeze(0)
+        
+        # Determine slices in the z-axis that are not padded (non-zero slices)
+        mask = x.sum(dim=(1, 2)) != 0  # True for non-padded slices
+        non_padded_indices = torch.where(mask)[0]
+
+        # Extract the actual scan (ignoring padded slices)
+        actual_scan = x[non_padded_indices]
+
+        # Initialize the mask array
+        scan_mask = torch.zeros_like(actual_scan, dtype=torch.uint8)
+
+        # Remove chunks randomly from the scan, totaling to `mask_ratio` of the scan
+        mask_ratio = self.args.mask_ratio
+
+        # Calculate the number of voxels to mask
+        total_voxels = actual_scan.numel()
+        mask_voxels = int(total_voxels * mask_ratio)
+
+        # Calculate the number of chunks to remove
+        ms = self.args.mask_size
+        chunk_size = ms**3
+        num_chunks = mask_voxels // chunk_size
+
+        # Randomly select coordinates for all chunks
+        z_coords = np.random.randint(0, max(1, actual_scan.shape[0] - ms), size=num_chunks)
+        y_coords = np.random.randint(0, max(1, actual_scan.shape[1] - ms), size=num_chunks)
+        x_coords = np.random.randint(0, max(1, actual_scan.shape[2] - ms), size=num_chunks)
+
+        # Apply the mask to all selected chunks
+        for z_itr, y_itr, x_itr in zip(z_coords, y_coords, x_coords):
+            actual_scan[z_itr:(z_itr + ms), y_itr:(y_itr + ms), x_itr:(x_itr + ms)] = 0
+            scan_mask[z_itr:(z_itr + ms), y_itr:(y_itr + ms), x_itr:(x_itr + ms)] = 1
+
+        # Place the modified actual_scan and scan_mask back into the padded arrays
+        x[non_padded_indices] = actual_scan
+        padded_mask = torch.zeros_like(x, dtype=torch.uint8)
+        padded_mask[non_padded_indices] = scan_mask
+
+        # Add the batch dimension back
+        x = x.unsqueeze(0)
+        padded_mask = padded_mask.unsqueeze(0)
+        
+        return x, padded_mask
+
+    def extract_subvolume(self, x):
+        # print(f'input to extract_subvolume: {x.shape}, min: {x.min()}, max: {x.max()}, mean: {x.mean()}')
+        # Get non-padded volume
+        x = x.squeeze(0)
+        mask = x.sum(dim=(1, 2)) != 0
+        non_padded_indices = torch.where(mask)[0]
+        x = x[non_padded_indices]
+        # print(f'non-padded x: {x.shape}, min: {x.min()}, max: {x.max()}, mean: {x.mean()}')
+
+        # calculate the actual dimensions of the subvolume
+        x_size = self.args.subvolume_size
+        y_size = self.args.subvolume_size
+        z_size = self.args.subvolume_size
+
+        # Get the current dimensions of the scan
+        z_dim, y_dim, x_dim = x.shape
+
+        # Calculate padding needed to match the sub-volume size
+        z_pad = max(0, z_size - z_dim)
+        y_pad = max(0, y_size - y_dim)
+        x_pad = max(0, x_size - x_dim)
+
+        # Add uniform padding if necessary
+        padding = (
+            x_pad // 2, x_pad - x_pad // 2,  # Padding for x-dimension
+            y_pad // 2, y_pad - y_pad // 2,  # Padding for y-dimension
+            z_pad // 2, z_pad - z_pad // 2   # Padding for z-dimension
+        )
+        x = torch.nn.functional.pad(x, padding, mode='constant', value=0)
+
+        # Calculate random start indices for sub-volume extraction
+        z_start = np.random.randint(0, x.shape[0] - z_size + 1)
+        y_start = np.random.randint(0, x.shape[1] - y_size + 1)
+        x_start = np.random.randint(0, x.shape[2] - x_size + 1)
+
+        # Extract sub-volume of the scan
+        x = x[z_start:z_start + z_size,
+            y_start:y_start + y_size,
+            x_start:x_start + x_size]
+
+        # Add the batch dimension back
+        # print(f'sub-volume x: {x.shape}, min: {x.min()}, max: {x.max()}, mean: {x.mean()}')
+        x = x.unsqueeze(0)
+        return x
+
     def __len__(self):
+        if self.size > 0:
+            return self.size
         return len(self.dataset)
 
     def __getitem__(self, index):
+        index = index % len(self.dataset)
         sample = self.dataset[index]
-        if self.args.use_annotations:
-            sample = self.get_ct_annotations(sample)
         try:
             item = {}
             input_dict = self.get_images(sample["paths"], sample)
 
             x = input_dict["input"]
-
-            if self.args.use_annotations:
-                mask = torch.abs(input_dict["mask"])
-                mask_area = mask.sum(dim=(-1, -2))
-                item["volume_annotations"] = mask_area[0] / max(1, mask_area.sum())
-                item["annotation_areas"] = mask_area[0] / (
-                    mask.shape[-2] * mask.shape[-1]
-                )
-                mask_area = mask_area.unsqueeze(-1).unsqueeze(-1)
-                mask_area[mask_area == 0] = 1
-                item["image_annotations"] = mask / mask_area
-                item["has_annotation"] = item["volume_annotations"].sum() > 0
-
-            if self.args.use_risk_factors:
-                item["risk_factors"] = sample["risk_factors"]
-
+            if self.args.subvolume_size:
+                x = self.extract_subvolume(x)
             item["x"] = x
-            item["y"] = sample["y"]
-            for key in CT_ITEM_KEYS:
-                if key in sample:
-                    item[key] = sample[key]
+
+            if self.args.mask_size:
+                x_masked, mask = self.mask_scan(x.clone())
+                item["x_masked"] = x_masked
+                item["mask"] = mask
 
             return item
         except Exception:
@@ -597,21 +707,26 @@ class NLST_Survival_Dataset(data.Dataset):
         if self.args.fix_seed_for_multi_image_augmentations:
             sample["seed"] = np.random.randint(0, 2**32 - 1)
 
-        # get images for multi image input
+        # Prepare input for multi-image input
         s = copy.deepcopy(sample)
-        input_dicts = []
-        for e, path in enumerate(paths):
-            if self.args.use_annotations:
-                s["annotations"] = sample["annotations"][e]
-            input_dicts.append(self.input_loader.get_image(path, s))
 
+        def load_image(path, idx):
+            local_sample = copy.deepcopy(s)
+            local_sample["seed"] = np.random.randint(0, 2**32 - 1)
+            return self.input_loader.get_image(path, local_sample)
+
+        # Parallelize the loading of images
+        with ThreadPoolExecutor() as executor:
+            input_dicts = list(executor.map(load_image, paths, range(len(paths))))
+
+        # Process images after loading
         images = [i["input"] for i in input_dicts]
         input_arr = self.reshape_images(images)
         if self.args.use_annotations:
             masks = [i["mask"] for i in input_dicts]
             mask_arr = self.reshape_images(masks) if self.args.use_annotations else None
 
-        # resample pixel spacing
+        # Resample pixel spacing
         resample_now = self.args.resample_pixel_spacing_prob > np.random.uniform()
         if self.always_resample_pixel_spacing or resample_now:
             spacing = torch.tensor(sample["pixel_spacing"] + [1])
@@ -636,6 +751,7 @@ class NLST_Survival_Dataset(data.Dataset):
 
         return out_dict
 
+
     def reshape_images(self, images):
         images = [im.unsqueeze(0) for im in images]
         images = torch.cat(images, dim=0)
@@ -648,8 +764,8 @@ class NLST_Survival_Dataset(data.Dataset):
         for i, tau in enumerate(BINS):
             if thickness <= tau:
                 return i
-        if self.args.slice_thickness_filter is not None:
-            raise ValueError("THICKNESS > 2.5")
+        # if self.args.slice_thickness_filter is not None:
+        #     raise ValueError("THICKNESS > 2.5")
         return 4
 
 

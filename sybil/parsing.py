@@ -101,7 +101,7 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--train",
         action="store_true",
-        default=False,
+        default=True,
         help="Whether or not to train model",
     )
     parser.add_argument(
@@ -150,7 +150,7 @@ def parse_args(args_strings=None):
         help="Width and height of image in pixels. [default: [256,256]]",
     )
     parser.add_argument(
-        "--num_chan", type=int, default=3, help="Number of channels for input image"
+        "--num_chan", type=int, default=1, help="Number of channels for input image"
     )
     parser.add_argument(
         "--img_mean",
@@ -169,7 +169,7 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--img_dir",
         type=str,
-        default="/data/rsg/mammogram/NLST/nlst-ct-png",
+        default="/home/yuriahuja/nlst-complete/home/yuriahuja/NLST_images_png",
         help="Dir of images. Note, image path in dataset jsons should stem from here",
     )
     parser.add_argument(
@@ -182,13 +182,13 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--fix_seed_for_multi_image_augmentations",
         action="store_true",
-        default=False,
+        default=True,
         help="Use same seed for each slice of volume augmentations",
     )
     parser.add_argument(
         "--dataset_file_path",
         type=str,
-        default="/Mounts/rbg-storage1/datasets/NLST/full_nlst_google.json",
+        default = "/home/yuriahuja/nlst-complete/home/yuriahuja/nlst-dataset.json",
         help="Path to dataset file either as json or csv",
     )
     parser.add_argument(
@@ -264,12 +264,13 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--slice_thickness_filter",
         type=float,
+        default=2.5,
         help="Slice thickness using, if restricting to specific thickness value.",
     )
     parser.add_argument(
         "--use_only_thin_cuts_for_ct",
         action="store_true",
-        default=False,
+        default=True,
         help="Wether to use image series with thinnest cuts only.",
     )
 
@@ -321,13 +322,13 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=32,
-        help="Batch size for training [default: 128]",
+        default=1,
+        help="Batch size for training [default: 4]",
     )
     parser.add_argument(
         "--init_lr",
         type=float,
-        default=0.001,
+        default=3e-5,
         help="Initial learning rate [default: 0.001]",
     )
     parser.add_argument(
@@ -390,7 +391,7 @@ def parse_args(args_strings=None):
     )
 
     parser.add_argument(
-        "--save_dir", type=str, default="snapshot", help="Where to dump the model"
+        "--save_dir", type=str, default="/home/yuriahuja/nlst-complete/home/yuriahuja/foundation-model-output/save-dir", help="Where to dump the model"
     )
 
     parser.add_argument(
@@ -436,13 +437,13 @@ def parse_args(args_strings=None):
     parser.add_argument(
         "--results_path",
         type=str,
-        default="logs/test.args",
+        default="/home/yuriahuja/nlst-complete/home/yuriahuja/foundation-model-output/results",
         help="Where to save the result logs",
     )
 
     # cache
     parser.add_argument(
-        "--cache_path", type=str, default=None, help="Dir to cache images."
+        "--cache_path", type=str, default='/home/yuriahuja/nlst-complete/home/yuriahuja/foundation-model-output/cache', help="Dir to cache images."
     )
     parser.add_argument(
         "--cache_full_img",
@@ -450,11 +451,17 @@ def parse_args(args_strings=None):
         default=False,
         help="Cache full image locally as well as cachable transforms",
     )
+    parser.add_argument(
+        "--gpus",
+        type=int,
+        default=2,
+        help="Number of gpus to use [default: 2]",
+    )
 
     # run
-    parser = Trainer.add_argparse_args(parser)
+    # parser = Trainer.add_argparse_args(parser)
     if args_strings is None:
-        args = parser.parse_args()
+        args, unknown = parser.parse_known_args()
     else:
         args = parser.parse_args(args_strings)
     args.lr = args.init_lr
